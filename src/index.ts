@@ -27,6 +27,10 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const API_TIMEOUT = parseInt(process.env.API_TIMEOUT_MS ?? "10000", 10);
 const CACHE_TTL = parseInt(process.env.CACHE_TTL_MS ?? "300000", 10);
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT_PER_MIN ?? "100", 10);
+// Browser origins allowed to call the MCP endpoint (MCP Streamable HTTP: servers MUST validate Origin, against DNS
+// rebinding). Requests without an Origin header (MCP clients, curl, server-side agents) are not affected.
+// Comma-separated; "*" allows every origin.
+const ALLOWED_ORIGINS = new Set((process.env.MCP_ALLOWED_ORIGINS ?? "https://ranatec.com,https://www.ranatec.com").split(",").map((o) => o.trim().replace(/\/+$/, "").toLowerCase()).filter(Boolean));
 
 // ----------------------------------------------------------------------------- types (subset of the API)
 
@@ -210,14 +214,15 @@ function buildServer(clientIp = ""): McpServer {
     title: "List news", description: desc("list_news"), annotations: READ_ONLY,
     inputSchema: {
       type: z.enum(["product-launch", "technical-article", "company-news", "event", "distribution-partner"]).optional(),
-      year: z.string().regex(/^\d{4}$/).optional(),
+      // Agents send the year as a number (2026) or a string ("2026"); accept both.
+      year: z.union([z.number().int().min(1900).max(2100), z.string().regex(/^\d{4}$/)]).optional().describe("Publication year, e.g. 2026"),
       product: z.string().optional().describe("Only items related to this product id"),
       query: z.string().optional(),
       limit: z.number().int().min(1).max(100).optional().describe("Default 20"),
     },
   }, async ({ type, year, product, query, limit }) => guard(async () => {
     const q = query?.toLowerCase();
-    const list = (await news()).filter((n) => (!type || n.type === type) && (!year || n.date_published?.startsWith(year))
+    const list = (await news()).filter((n) => (!type || n.type === type) && (!year || n.date_published?.startsWith(String(year)))
       && (!product || n.related_product_ids.includes(product)) && (!q || JSON.stringify(n).toLowerCase().includes(q)));
     return ok({ count: list.length, news: list.slice(0, limit ?? 20).map(newsSummary) });
   }));
@@ -372,6 +377,12 @@ const limiter = rateLimit({ windowMs: 60 * 1000, limit: RATE_LIMIT, standardHead
 // The MCP endpoint answers on /mcp (reverse proxy keeps the path) AND on / (cPanel "Setup Node.js App" /
 // Phusion Passenger mounted at ranatec.com/mcp strips the /mcp prefix).
 const MCP_PATHS = ["/mcp", "/"];
+// Origin check first, so a rejected browser request never reaches the rate limiter, the body parser or a tool.
+app.all(MCP_PATHS, (req: Request, res: Response, next: () => void) => {
+  const origin = req.headers.origin;
+  if (origin === undefined || ALLOWED_ORIGINS.has("*") || ALLOWED_ORIGINS.has(String(origin).replace(/\/+$/, "").toLowerCase())) return next();
+  res.status(403).json({ jsonrpc: "2.0", error: { code: -32000, message: `Forbidden: requests from origin ${String(origin).slice(0, 100)} are not allowed. Call this MCP server from an MCP client or server-side code (no Origin header).` }, id: null });
+});
 app.use(MCP_PATHS, limiter);
 app.use(MCP_PATHS, express.json({ limit: "100kb" }));
 
@@ -435,6 +446,22 @@ const methodNotAllowed = (_req: Request, res: Response) => {
 };
 app.get(MCP_PATHS, methodNotAllowed);
 app.delete(MCP_PATHS, methodNotAllowed);
+
+// Unknown paths and request errors always answer in JSON — never Express's HTML error page, which prints the
+// stack trace and server file paths whenever NODE_ENV is not "production".
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: "not_found", message: "Unknown path. MCP endpoint: POST /mcp · tool list: GET /mcp/tools · health: GET /mcp/health" });
+});
+app.use((err: { type?: string; status?: number; statusCode?: number }, _req: Request, res: Response, _next: () => void) => {
+  const status = err.status ?? err.statusCode ?? 500;
+  const [code, message] =
+    err.type === "entity.parse.failed" ? [-32700, "Parse error: the request body is not valid JSON"]
+    : err.type === "entity.too.large" ? [-32600, "Invalid request: the body is larger than 100 KB"]
+    : status < 500 ? [-32600, "Invalid request"]
+    : [-32603, "Internal MCP server error"];
+  if (status >= 500) console.error("MCP request error:", err);
+  if (!res.headersSent) res.status(status).json({ jsonrpc: "2.0", error: { code, message }, id: null });
+});
 
 app.listen(PORT, () => {
   console.log(`${NAME} ${VERSION} listening on :${PORT} (API ${API_BASE})`);
